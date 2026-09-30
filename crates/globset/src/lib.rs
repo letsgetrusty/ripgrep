@@ -535,10 +535,10 @@ impl GlobSet {
             strats.push(GlobSetMatchStrategy::Literal(lits));
         }
         if !suffixes.is_empty() {
-            strats.push(GlobSetMatchStrategy::Suffix(suffixes.suffix()));
+            strats.push(suffixes.suffix());
         }
         if !prefixes.is_empty() {
-            strats.push(GlobSetMatchStrategy::Prefix(prefixes.prefix()));
+            strats.push(prefixes.prefix());
         }
         if !required_exts.0.is_empty() {
             strats.push(GlobSetMatchStrategy::RequiredExtension(
@@ -657,6 +657,8 @@ enum GlobSetMatchStrategy {
     Extension(ExtensionStrategy),
     Prefix(PrefixStrategy),
     Suffix(SuffixStrategy),
+    SmallPrefix(Vec<(usize, String)>),
+    SmallSuffix(Vec<(usize, String)>),
     RequiredExtension(RequiredExtensionStrategy),
     Regex(RegexSetStrategy),
 }
@@ -670,6 +672,16 @@ impl GlobSetMatchStrategy {
             Extension(ref s) => s.is_match(candidate),
             Prefix(ref s) => s.is_match(candidate),
             Suffix(ref s) => s.is_match(candidate),
+            SmallPrefix(ref literals) => {
+                literals.iter().any(|(_, literal)| {
+                    candidate.path.starts_with(literal.as_bytes())
+                })
+            }
+            SmallSuffix(ref literals) => {
+                literals.iter().any(|(_, literal)| {
+                    candidate.path.ends_with(literal.as_bytes())
+                })
+            }
             RequiredExtension(ref s) => s.is_match(candidate),
             Regex(ref s) => s.is_match(candidate),
         }
@@ -687,6 +699,22 @@ impl GlobSetMatchStrategy {
             Extension(ref s) => s.matches_into(candidate, matches),
             Prefix(ref s) => s.matches_into(candidate, matches),
             Suffix(ref s) => s.matches_into(candidate, matches),
+            SmallPrefix(ref literals) => matches.extend(
+                literals.iter().filter_map(|(index, literal)| {
+                    candidate
+                        .path
+                        .starts_with(literal.as_bytes())
+                        .then_some(*index)
+                }),
+            ),
+            SmallSuffix(ref literals) => matches.extend(
+                literals.iter().filter_map(|(index, literal)| {
+                    candidate
+                        .path
+                        .ends_with(literal.as_bytes())
+                        .then_some(*index)
+                }),
+            ),
             RequiredExtension(ref s) => s.matches_into(candidate, matches),
             Regex(ref s) => s.matches_into(candidate, matches),
         }
@@ -700,6 +728,16 @@ impl GlobSetMatchStrategy {
             Extension(ref s) => s.matches_all(candidate),
             Prefix(ref s) => s.matches_all(candidate),
             Suffix(ref s) => s.matches_all(candidate),
+            SmallPrefix(ref literals) => {
+                literals.iter().all(|(_, literal)| {
+                    candidate.path.starts_with(literal.as_bytes())
+                })
+            }
+            SmallSuffix(ref literals) => {
+                literals.iter().all(|(_, literal)| {
+                    candidate.path.ends_with(literal.as_bytes())
+                })
+            }
             RequiredExtension(ref s) => s.matches_all(candidate),
             Regex(ref s) => s.matches_all(candidate),
         }
@@ -1032,20 +1070,37 @@ impl MultiStrategyBuilder {
         self.literals.push(literal);
     }
 
-    fn prefix(self) -> PrefixStrategy {
-        PrefixStrategy {
+    fn prefix(self) -> GlobSetMatchStrategy {
+        // For a bounded number of affixes, direct comparisons avoid the
+        // automaton's iterator and state-transition overhead. Bound their
+        // total length too, so long shared prefixes retain linear scanning.
+        if self.literals.len() <= 4
+            && self.literals.iter().map(String::len).sum::<usize>() <= 64
+        {
+            return GlobSetMatchStrategy::SmallPrefix(
+                self.map.into_iter().zip(self.literals).collect(),
+            );
+        }
+        GlobSetMatchStrategy::Prefix(PrefixStrategy {
             matcher: AhoCorasick::new(&self.literals).unwrap(),
             map: self.map,
             longest: self.longest,
-        }
+        })
     }
 
-    fn suffix(self) -> SuffixStrategy {
-        SuffixStrategy {
+    fn suffix(self) -> GlobSetMatchStrategy {
+        if self.literals.len() <= 4
+            && self.literals.iter().map(String::len).sum::<usize>() <= 64
+        {
+            return GlobSetMatchStrategy::SmallSuffix(
+                self.map.into_iter().zip(self.literals).collect(),
+            );
+        }
+        GlobSetMatchStrategy::Suffix(SuffixStrategy {
             matcher: AhoCorasick::new(&self.literals).unwrap(),
             map: self.map,
             longest: self.longest,
-        }
+        })
     }
 
     fn regex_set(self) -> Result<RegexSetStrategy, Error> {
@@ -1163,6 +1218,74 @@ mod tests {
         assert_eq!(2, matches.len());
         assert_eq!(0, matches[0]);
         assert_eq!(2, matches[1]);
+    }
+
+    #[test]
+    fn small_affixes_preserve_match_indices() {
+        for patterns in [
+            vec!["ab*"],
+            vec!["*ab"],
+            vec!["**/ab/cd"],
+            vec!["ab*", "ab*"],
+            vec!["*ab", "*ab"],
+            vec!["abcdefghijklmnop*"; 4],
+            vec!["abcdefghijklmnopq*"; 4],
+            vec!["*abcdefghijklmnop"; 4],
+            vec!["*abcdefghijklmnopq"; 4],
+            vec!["a*", "ab*", "abc*", "abcd*"],
+            vec!["a*", "ab*", "abc*", "abcd*", "abcde*"],
+            vec!["*a", "*ba", "*cba", "*dcba"],
+            vec!["*a", "*ba", "*cba", "*dcba", "*edcba"],
+            vec!["ab*", "*ab", "**/ab/cd", "*.txt", "ab"],
+        ] {
+            let set = build_glob_set(&patterns);
+            let regexes: Vec<_> = patterns
+                .iter()
+                .map(|pattern| {
+                    super::new_regex(Glob::new(pattern).unwrap().regex())
+                        .unwrap()
+                })
+                .collect();
+            for path in [
+                "",
+                "a",
+                "ab",
+                "abc",
+                "cab",
+                "ab/ab",
+                "ab/cd",
+                "x/ab/cd",
+                "ab.txt",
+                "abcd",
+                "abcde",
+                "dcba",
+                "edcba",
+                "abcdefghijklmnop",
+                "abcdefghijklmnopq",
+                "xabcdefghijklmnop",
+            ] {
+                let expected: Vec<_> = regexes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, regex)| {
+                        regex.is_match(path.as_bytes()).then_some(index)
+                    })
+                    .collect();
+                let mut matches = vec![usize::MAX];
+                set.matches_into(path, &mut matches);
+                assert_eq!(expected, matches, "{patterns:?} {path:?}");
+                assert_eq!(!expected.is_empty(), set.is_match(path));
+                // Component suffixes are represented by alternative literal
+                // and suffix strategies. This existing matches_all limitation
+                // is independent of affix matching.
+                if !patterns.iter().any(|pattern| pattern.starts_with("**/")) {
+                    assert_eq!(
+                        expected.len() == patterns.len(),
+                        set.matches_all(path)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
