@@ -1,6 +1,7 @@
 .*.swp
 tags
 target
+/benchmark-results/
 /grep/Cargo.lock
 /globset/Cargo.lock
 /ignore/Cargo.lock

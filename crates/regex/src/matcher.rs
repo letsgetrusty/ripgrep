@@ -1,4 +1,5 @@
 use {
+    bstr::ByteSlice,
     grep_matcher::{
         ByteSet, Captures, LineMatchKind, LineTerminator, Match, Matcher,
         NoError,
@@ -10,6 +11,78 @@ use {
 };
 
 use crate::{config::Config, error::Error, literal::InnerLiterals};
+
+/// Count the bytes used by a conservative match-length bound.
+fn count_relevant_bytes(bytes: &[u8], ascii: bool) -> usize {
+    if ascii {
+        bytes.iter().map(|byte| usize::from(byte.is_ascii())).sum()
+    } else {
+        bytes.iter().map(|&byte| usize::from(byte & 0xC0 != 0x80)).sum()
+    }
+}
+
+/// Count only until a rejection bound is met, in vectorizable chunks.
+fn count_relevant_bytes_up_to(
+    bytes: &[u8],
+    ascii: bool,
+    limit: usize,
+) -> usize {
+    let mut count = 0;
+    for chunk in bytes.chunks(64) {
+        count += count_relevant_bytes(chunk, ascii);
+        if count >= limit {
+            return limit;
+        }
+    }
+    count
+}
+
+/// Lower bound on ASCII bytes, or on non-continuation bytes, in a match.
+/// Neither mode assumes valid UTF-8 input: a class contributes one only
+/// when every possible match must contain a byte of the requested kind.
+fn minimum_relevant_bytes(hir: &regex_syntax::hir::Hir, ascii: bool) -> usize {
+    use regex_syntax::hir::{Class, HirKind};
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => 0,
+        HirKind::Literal(literal) => count_relevant_bytes(&literal.0, ascii),
+        HirKind::Class(Class::Unicode(class)) => usize::from(
+            !ascii || class.iter().all(|range| range.end().is_ascii()),
+        ),
+        HirKind::Class(Class::Bytes(class)) => {
+            usize::from(class.iter().all(|range| {
+                if ascii {
+                    range.end().is_ascii()
+                } else {
+                    range.start() > 0xBF || range.end() < 0x80
+                }
+            }))
+        }
+        HirKind::Repetition(repetition) => {
+            minimum_relevant_bytes(&repetition.sub, ascii)
+                .saturating_mul(repetition.min as usize)
+        }
+        HirKind::Capture(capture) => {
+            minimum_relevant_bytes(&capture.sub, ascii)
+        }
+        HirKind::Concat(parts) => parts.iter().fold(0usize, |total, part| {
+            total.saturating_add(minimum_relevant_bytes(part, ascii))
+        }),
+        HirKind::Alternation(parts) => parts
+            .iter()
+            .map(|part| minimum_relevant_bytes(part, ascii))
+            .min()
+            .unwrap_or(0),
+    }
+}
+
+/// Per-pattern rejection bounds; no state is retained between searches.
+#[derive(Clone, Copy, Debug)]
+struct LineLengthFilter {
+    terminator: u8,
+    minimum_bytes: usize,
+    minimum_units: usize,
+    ascii_units: bool,
+}
 
 /// A builder for constructing a `Matcher` using regular expressions.
 ///
@@ -76,12 +149,47 @@ impl RegexMatcherBuilder {
         // regex engine is likely to handle this case for us since it's so
         // simple, but the idea applies.)
         let fast_line_regex = InnerLiterals::new(&chir, &regex).one_regex()?;
+        let line_length_filter =
+            if fast_line_regex.is_none() && !regex.is_accelerated() {
+                chir.line_terminator().and_then(|term| {
+                    chir.hir()
+                        .properties()
+                        .minimum_len()
+                        // Short patterns reject too few lines; very large
+                        // bounds would make speculative scans expensive.
+                        .filter(|len| (32..=256).contains(len))
+                        .and_then(|len| {
+                            let ascii_minimum =
+                                minimum_relevant_bytes(chir.hir(), true);
+                            let ascii = ascii_minimum >= 32;
+                            let leading = if ascii {
+                                ascii_minimum
+                            } else {
+                                minimum_relevant_bytes(chir.hir(), false)
+                            };
+                            (leading >= 32).then_some(LineLengthFilter {
+                                terminator: term.as_byte(),
+                                minimum_bytes: len,
+                                minimum_units: leading,
+                                ascii_units: ascii,
+                            })
+                        })
+                })
+            } else {
+                None
+            };
 
         // We override the line terminator in case the configured HIR doesn't
         // support it.
         let mut config = self.config.clone();
         config.line_terminator = chir.line_terminator();
-        Ok(RegexMatcher { config, regex, fast_line_regex, non_matching_bytes })
+        Ok(RegexMatcher {
+            config,
+            regex,
+            fast_line_regex,
+            non_matching_bytes,
+            line_length_filter,
+        })
     }
 
     /// Build a new matcher from a plain alternation of literals.
@@ -377,6 +485,9 @@ pub struct RegexMatcher {
     fast_line_regex: Option<Regex>,
     /// A set of bytes that will never appear in a match.
     non_matching_bytes: ByteSet,
+    /// A lower bound that can reject short lines before invoking an
+    /// unaccelerated regex. Only valid when matches cannot cross lines.
+    line_length_filter: Option<LineLengthFilter>,
 }
 
 impl RegexMatcher {
@@ -400,6 +511,94 @@ impl RegexMatcher {
     /// `\s`) are removed transparently.
     pub fn new_line_matcher(pattern: &str) -> Result<RegexMatcher, Error> {
         RegexMatcherBuilder::new().line_terminator(Some(b'\n')).build(pattern)
+    }
+
+    /// Reject provably short lines, preserving full-haystack context for
+    /// regex verification and reverting when rejection is not worthwhile.
+    fn find_candidate_line_by_length(
+        &self,
+        haystack: &[u8],
+        filter: &LineLengthFilter,
+    ) -> Result<Option<LineMatchKind>, NoError> {
+        let LineLengthFilter {
+            terminator,
+            minimum_bytes: minimum,
+            minimum_units: leading,
+            ascii_units: ascii,
+        } = *filter;
+        let mut start = 0;
+        let mut rejected = 0;
+        let mut searches = 0;
+        while haystack.len() - start >= minimum {
+            // A terminator in this window proves every complete line
+            // before it is too short. Skip several short lines at once.
+            if let Some(offset) =
+                haystack[start..start + minimum].rfind_byte(terminator)
+            {
+                start += offset + 1;
+                rejected += offset + 1;
+                continue;
+            }
+            let prefix_units =
+                if !ascii && haystack[start..start + minimum].is_ascii() {
+                    minimum
+                } else {
+                    count_relevant_bytes_up_to(
+                        &haystack[start..start + minimum],
+                        ascii,
+                        leading,
+                    )
+                };
+            if searches >= 8 && rejected < start / 4 {
+                // A small sample with little rejection does not justify
+                // continued per-line verification. Keep this decision local
+                // to this search, without shared or learned matcher state.
+                return Ok(self
+                    .shortest_match_at(haystack, start)?
+                    .map(LineMatchKind::Confirmed));
+            }
+            // Do not add a full scan of an arbitrarily long line just
+            // to discover its boundary. The regex can scan it directly.
+            let probe_end =
+                (start + minimum).saturating_add(1024).min(haystack.len());
+            let end = match haystack[start + minimum..probe_end]
+                .find_byte(terminator)
+            {
+                Some(offset) => start + minimum + offset,
+                None if probe_end == haystack.len() => haystack.len(),
+                None => {
+                    return Ok(self
+                        .shortest_match_at(haystack, start)?
+                        .map(LineMatchKind::Confirmed));
+                }
+            };
+            if prefix_units < leading {
+                let units = prefix_units
+                    + count_relevant_bytes_up_to(
+                        &haystack[start + minimum..end],
+                        ascii,
+                        leading - prefix_units,
+                    );
+                if units < leading {
+                    if end == haystack.len() {
+                        break;
+                    }
+                    rejected += end + 1 - start;
+                    start = end + 1;
+                    continue;
+                }
+            }
+            let input = Input::new(haystack).span(start..end);
+            searches += 1;
+            if let Some(found) = self.regex.search_half(&input) {
+                return Ok(Some(LineMatchKind::Confirmed(found.offset())));
+            }
+            if end == haystack.len() {
+                break;
+            }
+            start = end + 1;
+        }
+        Ok(None)
     }
 }
 
@@ -492,6 +691,9 @@ impl Matcher for RegexMatcher {
         &self,
         haystack: &[u8],
     ) -> Result<Option<LineMatchKind>, NoError> {
+        if let Some(ref filter) = self.line_length_filter {
+            return self.find_candidate_line_by_length(haystack, filter);
+        }
         Ok(match self.fast_line_regex {
             Some(ref regex) => {
                 let input = Input::new(haystack);
@@ -553,6 +755,211 @@ impl RegexCaptures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leading_byte_bounds() {
+        let all_bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(128, count_relevant_bytes(&all_bytes, true));
+        assert_eq!(192, count_relevant_bytes(&all_bytes, false));
+        for ascii in [false, true] {
+            for limit in [0, 1, 31, 32, 64, 128, 192, 256] {
+                assert_eq!(
+                    count_relevant_bytes(&all_bytes, ascii).min(limit),
+                    count_relevant_bytes_up_to(&all_bytes, ascii, limit)
+                );
+            }
+        }
+        for (pattern, expected) in [
+            (r"\w{40}", 40),
+            (r"(?:\w{32}|[0-9]{64})", 32),
+            (r"(?-u:\x80{40})", 0),
+            (r"(?-u:[a\x80]{40})", 0),
+            (r"(?-u:[a-z]{40})", 40),
+            (r"(?-u:[\x7f-\x80]{40})", 0),
+            (r"(?-u:[\xbf-\xc0]{40})", 0),
+            (r"\b(?:\w{32})\b", 32),
+            (r"\w*", 0),
+            ("é{40}", 40),
+        ] {
+            let hir = regex_syntax::ParserBuilder::new()
+                .utf8(false)
+                .build()
+                .parse(pattern)
+                .unwrap();
+            assert_eq!(
+                expected,
+                minimum_relevant_bytes(&hir, false),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_byte_bounds() {
+        for (pattern, expected) in [
+            (r"\w{40}", 0),
+            (r"(?-u:[a-z]{40})", 40),
+            (r"(?-u:[a\x80]{40})", 0),
+            (r"(?:a{40}|b{50})", 40),
+            (r"(?:[a-z]{20}){2}", 40),
+            ("é{40}", 0),
+            (r"(?:[a-z]{40})?", 0),
+        ] {
+            let hir = regex_syntax::ParserBuilder::new()
+                .utf8(false)
+                .build()
+                .parse(pattern)
+                .unwrap();
+            assert_eq!(
+                expected,
+                minimum_relevant_bytes(&hir, true),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_length_filter_is_bounded() {
+        for (pattern, enabled) in [
+            (r"\w{40}", true),
+            (r"\w{256}", true),
+            (r"\w{257}", false),
+            (r"(?-u:[a-z]{32}[\x80-\xbf]{4096})", false),
+        ] {
+            let matcher = RegexMatcher::new_line_matcher(pattern).unwrap();
+            assert_eq!(
+                enabled,
+                matcher.line_length_filter.is_some(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_length_filter_mixed_lines() {
+        for (terminator, crlf) in [(b'\n', false), (b'\n', true), (0, false)] {
+            let mut builder = RegexMatcherBuilder::new();
+            builder.multi_line(true);
+            if crlf {
+                builder.crlf(true);
+            } else {
+                builder.line_terminator(Some(terminator));
+            }
+            let matcher = builder.build(r"\b\w{40}\b").unwrap();
+            assert!(matcher.line_length_filter.is_some());
+            let mut haystack = vec![];
+            for length in [2, 31, 39, 41, 256, 1024, 1064, 1065, 4096, 0, 40] {
+                haystack.extend(b"a".repeat(length));
+                if crlf {
+                    haystack.push(b'\r');
+                }
+                haystack.push(terminator);
+            }
+            let expected = matcher.regex.search_half(&Input::new(&haystack));
+            let got = matcher.find_candidate_line(&haystack).unwrap();
+            assert_eq!(
+                expected.map(|m| m.offset()),
+                got.map(|kind| match kind {
+                    LineMatchKind::Confirmed(offset) => offset,
+                    LineMatchKind::Candidate(_) =>
+                        panic!("expected confirmed match"),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn line_length_filter_matches_regex() {
+        for pattern in [
+            r"\w{40}",
+            r"(?-u:[A-Za-z]{40})",
+            r"(?:\w{32}|[0-9]{64})",
+            r"\b\w{40}\b",
+            r"(?m)^\w{40}$",
+            r"[^\n]{40}",
+            r"(?-u:\x80{40})",
+            r"\A\w{40}",
+        ] {
+            for (terminator, crlf, word, whole_line) in [
+                (b'\n', false, false, false),
+                (b'\n', true, false, false),
+                (b'\n', true, true, false),
+                (b'\n', true, false, true),
+                (b'\x00', false, false, false),
+                (b'\r', false, false, false),
+            ] {
+                let mut builder = RegexMatcherBuilder::new();
+                builder.multi_line(true).word(word).whole_line(whole_line);
+                if crlf {
+                    builder.crlf(true);
+                } else {
+                    builder.line_terminator(Some(terminator));
+                }
+                let matcher = builder.build(pattern).unwrap();
+                for length in [
+                    0, 31, 32, 39, 40, 41, 64, 128, 256, 257, 296, 297, 4096,
+                    4097,
+                ] {
+                    for word in [
+                        b"a".as_slice(),
+                        "é".as_bytes(),
+                        "Ж".as_bytes(),
+                        b"\x80",
+                        b"a\x80",
+                        b"\r",
+                        b" ",
+                    ] {
+                        let mut haystack = b"short".to_vec();
+                        haystack.push(terminator);
+                        haystack.extend(word.repeat(length));
+                        if crlf {
+                            haystack.push(b'\r');
+                        }
+                        haystack.push(terminator);
+                        haystack.extend(b"a".repeat(40));
+                        for end in [haystack.len() - 40, haystack.len()] {
+                            let haystack = &haystack[..end];
+                            let expected = matcher
+                                .regex
+                                .search_half(&Input::new(haystack));
+                            let got =
+                                matcher.find_candidate_line(haystack).unwrap();
+                            // The existing literal prefilter may report false
+                            // positives. Length filtering only reports confirmed
+                            // matches, and must agree with the complete regex.
+                            if matches!(got, Some(LineMatchKind::Candidate(_)))
+                            {
+                                assert!(matcher.line_length_filter.is_none());
+                                continue;
+                            }
+                            assert_eq!(
+                                expected.is_some(),
+                                got.is_some(),
+                                "{pattern} {haystack:?}"
+                            );
+                            if let (
+                                Some(expected),
+                                Some(LineMatchKind::Confirmed(offset)),
+                            ) = (expected, got)
+                            {
+                                let line = |offset| {
+                                    haystack[..offset]
+                                        .iter()
+                                        .filter(|&&byte| byte == terminator)
+                                        .count()
+                                };
+                                assert_eq!(
+                                    line(expected.offset()),
+                                    line(offset),
+                                    "{pattern} {haystack:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Test that enabling word matches does the right thing and demonstrate
     // the difference between it and surrounding the regex in `\b`.

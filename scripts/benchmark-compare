@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Compare fresh source snapshots without touching the user's checkout.
+set -euo pipefail
+
+if [[ ${1:-} == --help ]]; then
+    cat <<'HELP'
+Usage: scripts/benchmark-compare [BASE_COMMIT]
+
+Before defaults to the original pre-optimization commit, 3fce3b5bb0236da2df6d99672afb8a719642eca7.
+After includes the current tracked working-tree files (including uncommitted edits).
+Untracked library source must be added to Git's index first.
+
+Builds and tests both snapshots, then runs the existing CLI and glob suites
+sequentially in before/after/after/before order. Displays only the final
+(second-pass) comparison. First-pass and drift reports are saved with the logs.
+No source changes or checkout switching.
+
+Results: benchmark-results/compare-TIMESTAMP.XXXXXX
+Isolated worktrees/builds: target/benchmark-comparisons/RUN_NAME
+Corpus: BENCH_CORPUS_DIR, default target/benchmark-data (must already exist).
+Requires Git, Python 3, Rust 1.96.0 and nightly, as scripts/benchmark does.
+Keep power connected and avoid other intensive work during measurements.
+HELP
+    exit 0
+fi
+if [[ $# -gt 1 ]]; then
+    echo 'Expected at most one base commit. Use --help.' >&2
+    exit 2
+fi
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo"
+base=$(git rev-parse --verify "${1:-3fce3b5bb0236da2df6d99672afb8a719642eca7}^{commit}")
+export BENCH_CORPUS_DIR="${BENCH_CORPUS_DIR:-$repo/target/benchmark-data}"
+for corpus in en.sample.txt ru.txt; do
+    if [[ ! -s "$BENCH_CORPUS_DIR/subtitles/$corpus" ]]; then
+        echo "Missing corpus: $BENCH_CORPUS_DIR/subtitles/$corpus" >&2
+        echo 'See scripts/benchmark --help for dataset setup.' >&2
+        exit 1
+    fi
+done
+BENCH_CORPUS_DIR=$(cd "$BENCH_CORPUS_DIR" && pwd)
+rustc +1.96.0 --version > /dev/null
+rustc +nightly --version > /dev/null
+python3 --version > /dev/null
+
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RIPGREP_CONFIG_PATH CARGO_TARGET_DIR
+mkdir -p "$repo/benchmark-results" "$repo/target/benchmark-comparisons"
+results=$(mktemp -d "$repo/benchmark-results/compare-$(date +%Y%m%d-%H%M%S).XXXXXX")
+work="$repo/target/benchmark-comparisons/$(basename "$results")"
+mkdir -p "$work"
+# Keep the terminal quiet until the final report, but preserve diagnostics.
+exec 3>&1 4>&2
+exec > "$results/comparison.log" 2>&1
+trap 'status=$?; if [[ $status -ne 0 ]]; then echo "Comparison failed. See $results/comparison.log and preparation logs." >&4; fi' EXIT
+
+git diff --binary --no-ext-diff --no-textconv "$base" -- > "$results/changes.patch"
+{
+    printf 'Before commit: %s\nAfter: before plus changes.patch\n' "$base"
+    printf 'Worktrees: %s\nCorpus: %s\n' "$work" "$BENCH_CORPUS_DIR"
+    rustc +1.96.0 --version
+    rustc +nightly --version
+    git status --short
+} > "$results/provenance.txt"
+printf '\nPreparing isolated builds. Results: %s\n' "$results"
+for variant in before after; do
+    git worktree add --detach "$work/$variant" "$base"
+done
+if [[ -s "$results/changes.patch" ]]; then
+    git -C "$work/after" apply "$results/changes.patch"
+else
+    echo 'No tracked changes relative to the baseline; this is a same-source control.'
+fi
+
+# Both versions use the same current workload definitions and reporter.
+for variant in before after; do
+    cp "$repo/scripts/benchmark" "$repo/scripts/benchmark-report.py" \
+        "$work/$variant/scripts/"
+    cp "$repo/benchsuite/benchsuite" "$work/$variant/benchsuite/benchsuite"
+    cp "$repo/crates/globset/benches/bench.rs" \
+        "$work/$variant/crates/globset/benches/bench.rs"
+    printf '\nBUILD AND TEST: %s (logs: %s/%s-preparation.log)\n' \
+        "$variant" "$results" "$variant"
+    (
+        cd "$work/$variant"
+        export CARGO_TARGET_DIR="$PWD/target"
+        cargo +1.96.0 build --release --locked
+        cargo +nightly bench --locked -p globset --bench bench --no-run
+        cargo +1.96.0 test --workspace --release --locked --quiet
+    ) > "$results/$variant-preparation.log" 2>&1
+done
+
+printf '\nMeasurements: BEFORE, AFTER, AFTER, BEFORE. Suites run sequentially.\n'
+BENCH_OUTPUT_DIR="$results/before-1" bash "$work/before/scripts/benchmark"
+BENCH_OUTPUT_DIR="$results/after-1" bash "$work/after/scripts/benchmark" \
+    --baseline "$results/before-1"
+BENCH_OUTPUT_DIR="$results/after-2" bash "$work/after/scripts/benchmark"
+BENCH_OUTPUT_DIR="$results/before-2" bash "$work/before/scripts/benchmark"
+
+printf '\nCOMPARISON 1: before versus after\n'
+bash "$work/after/scripts/benchmark" --report "$results/after-1" \
+    --baseline "$results/before-1"
+printf '\nDRIFT CHECK: same before build, start versus end\n'
+bash "$work/before/scripts/benchmark" --report "$results/before-2" \
+    --baseline "$results/before-1"
+exec 1>&3 2>&4
+printf '\nFINAL COMPARISON: before versus after (second pass)\n'
+bash "$work/after/scripts/benchmark" --report "$results/after-2" \
+    --baseline "$results/before-2"
+printf '\nAll runs and diagnostics: %s\n' "$results"

@@ -133,8 +133,18 @@ impl std::str::FromStr for Glob {
 pub struct GlobMatcher {
     /// The underlying pattern.
     pat: Glob,
-    /// The pattern, as a compiled regex.
-    re: Regex,
+    /// A structural matcher when possible, otherwise a compiled regex.
+    strategy: SingleStrategy,
+}
+
+/// Exact matching of literal pieces avoids regex state and cache access.
+#[derive(Clone, Debug)]
+enum SingleStrategy {
+    Literal(String),
+    Prefix(String),
+    Suffix { literal: String, component: bool },
+    Recursive { prefix: String, suffix: String },
+    Regex(Regex),
 }
 
 impl GlobMatcher {
@@ -145,7 +155,25 @@ impl GlobMatcher {
 
     /// Tests whether the given path matches this pattern or not.
     pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
-        self.re.is_match(&path.path)
+        let path = &*path.path;
+        match self.strategy {
+            SingleStrategy::Literal(ref literal) => path == literal.as_bytes(),
+            SingleStrategy::Prefix(ref prefix) => {
+                path.starts_with(prefix.as_bytes())
+            }
+            SingleStrategy::Suffix { ref literal, component } => {
+                path.ends_with(literal.as_bytes())
+                    || (component && path == &literal.as_bytes()[1..])
+            }
+            SingleStrategy::Recursive { ref prefix, ref suffix } => {
+                // The separator can belong to both pieces when ** matches
+                // no directories. No other overlap is permitted.
+                path.len() >= prefix.len() + suffix.len() - 1
+                    && path.starts_with(prefix.as_bytes())
+                    && path.ends_with(suffix.as_bytes())
+            }
+            SingleStrategy::Regex(ref regex) => regex.is_match(path),
+        }
     }
 
     /// Returns the `Glob` used to compile this matcher.
@@ -286,16 +314,67 @@ impl Glob {
 
     /// Returns a matcher for this pattern.
     pub fn compile_matcher(&self) -> GlobMatcher {
-        let re =
-            new_regex(&self.re).expect("regex compilation shouldn't fail");
-        GlobMatcher { pat: self.clone(), re }
+        let strategy =
+            if let Some((prefix, suffix)) = self.recursive_literals() {
+                SingleStrategy::Recursive { prefix, suffix }
+            } else {
+                match MatchStrategy::new(self) {
+                    MatchStrategy::Literal(literal) => {
+                        SingleStrategy::Literal(literal)
+                    }
+                    MatchStrategy::BasenameLiteral(literal) => {
+                        SingleStrategy::Suffix {
+                            literal: format!("/{literal}"),
+                            component: true,
+                        }
+                    }
+                    MatchStrategy::Extension(literal) => {
+                        SingleStrategy::Suffix { literal, component: false }
+                    }
+                    MatchStrategy::Prefix(prefix) => {
+                        SingleStrategy::Prefix(prefix)
+                    }
+                    MatchStrategy::Suffix { suffix, component } => {
+                        SingleStrategy::Suffix { literal: suffix, component }
+                    }
+                    MatchStrategy::RequiredExtension(_)
+                    | MatchStrategy::Regex => SingleStrategy::Regex(
+                        new_regex(&self.re)
+                            .expect("regex compilation shouldn't fail"),
+                    ),
+                }
+            };
+        GlobMatcher { pat: self.clone(), strategy }
+    }
+
+    /// Extract the literal sides of a single recursive directory wildcard.
+    /// Other wildcards and case folding require the regex fallback.
+    fn recursive_literals(&self) -> Option<(String, String)> {
+        if self.opts.case_insensitive {
+            return None;
+        }
+        let middle = self
+            .tokens
+            .iter()
+            .position(|token| matches!(token, Token::RecursiveZeroOrMore))?;
+        let mut prefix = String::new();
+        for token in &self.tokens[..middle] {
+            let Token::Literal(character) = token else { return None };
+            prefix.push(*character);
+        }
+        prefix.push('/');
+        let mut suffix = String::from("/");
+        for token in &self.tokens[middle + 1..] {
+            let Token::Literal(character) = token else { return None };
+            suffix.push(*character);
+        }
+        Some((prefix, suffix))
     }
 
     /// Returns a strategic matcher.
     ///
-    /// This isn't exposed because it's not clear whether it's actually
-    /// faster than just running a regex for a *single* pattern. If it
-    /// is faster, then GlobMatcher should do it automatically.
+    /// This mirrors the set strategies for testing them independently of
+    /// the single-pattern matcher.
     #[cfg(test)]
     fn compile_strategic_matcher(&self) -> GlobStrategic {
         let strategy = MatchStrategy::new(self);
@@ -1080,6 +1159,79 @@ mod tests {
     use super::Token::*;
     use super::{Glob, GlobBuilder, Token};
     use crate::{ErrorKind, GlobSetBuilder};
+
+    #[test]
+    fn structural_matchers_agree_with_regex() {
+        // Include arbitrary bytes, empty components and parent-directory
+        // names: Candidate's basename semantics differ from regex semantics
+        // for '..', so it must not silently turn into a false negative.
+        let mut paths = vec![vec![]];
+        for length in 1..=5 {
+            let previous: Vec<_> = paths
+                .iter()
+                .filter(|path| path.len() == length - 1)
+                .cloned()
+                .collect();
+            for path in previous {
+                for byte in b"a./\n\xff" {
+                    let mut next = path.clone();
+                    next.push(*byte);
+                    paths.push(next);
+                }
+            }
+        }
+        paths.extend([
+            b"some/needle.txt".to_vec(),
+            b"some/a/b/needle.txt".to_vec(),
+            b"some/needle.txt/".to_vec(),
+            "some/\u{03b1}/needle.txt".as_bytes().to_vec(),
+            "\u{03b1}/\u{03b2}".as_bytes().to_vec(),
+        ]);
+        for pattern in [
+            "",
+            "a",
+            "..",
+            "a*",
+            "*a",
+            "*.",
+            "*.a",
+            "**/..",
+            "**/a",
+            "**/*.a",
+            "a/**/a",
+            "/**",
+            "a/**",
+            "/**/",
+            "a/**/",
+            "/**/a",
+            "a/**/**/a",
+            "a/?/a",
+            "a/[a.]/a",
+            "{a,b}",
+            "some/**/needle.txt",
+            "\u{03b1}/**/\u{03b2}",
+        ] {
+            for literal_separator in [false, true] {
+                for case_insensitive in [false, true] {
+                    let glob = GlobBuilder::new(pattern)
+                        .literal_separator(literal_separator)
+                        .case_insensitive(case_insensitive)
+                        .build()
+                        .unwrap();
+                    let matcher = glob.compile_matcher();
+                    let regex = crate::new_regex(glob.regex()).unwrap();
+                    for path in &paths {
+                        let candidate = crate::Candidate::from_bytes(path);
+                        assert_eq!(
+                            regex.is_match(&candidate.path),
+                            matcher.is_match_candidate(&candidate),
+                            "pattern={pattern:?}, path={path:?}, literal_separator={literal_separator}, case_insensitive={case_insensitive}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Default)]
     struct Options {
